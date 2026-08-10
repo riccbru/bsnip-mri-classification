@@ -1,0 +1,13 @@
+{
+  "bsnip_wenjie_manifest": {
+    "subject_id": "subject_id",
+    "site": "site",
+    "rel_path": "rel_path",
+    "final_dx": "diagnosis",
+    "prep_rating": "qc_rating"
+  },
+  "label_mapping": {
+    "HC": 0,
+    "SZ": 1
+  }
+}
