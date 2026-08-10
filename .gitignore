@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+
+# Output files
+*.pdf
+*.jpg
+*.png
+*.nii
+*.nii.gz
+*.pth
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Cache
+unsloth_compiled_cache/
+
+# Environment
+.env
+.venv
+
+# Misc
+DEV.md
+output.log
