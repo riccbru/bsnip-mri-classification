@@ -7,9 +7,6 @@ __pycache__/
 *.log
 
 # Output files
-*.pdf
-*.jpg
-*.png
 *.nii
 *.nii.gz
 *.pth
