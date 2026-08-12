@@ -18,7 +18,7 @@ training_log_bsnip.csv. The best checkpoint (by val AUC-ROC or val loss,
 best checkpoint is reloaded and evaluated once on the held-out test split.
 
 Usage:
-    python train_3dcnn.py --epochs 50 --batch-size 8 --lr 1e-4 --seed 42 --device cuda
+    python train_3dcnn.py --epochs 50 --batch-size 4 --lr 2e-5 --seed 42 --device cuda
 """
 
 from __future__ import annotations
@@ -61,6 +61,11 @@ class BSNIP3DCNN(Simple3DCNN):
     hardcoded for that shape. BSNIP volumes keep their native preprocessed
     shape (see preprocessing.py), so fc1's input size is computed here from
     an actual `input_shape` via a dummy forward pass, then fc1 is replaced.
+
+    Also overrides the base class's dropout (p=0.5) with p=0.4, applied
+    between fc1 and fc2 by the inherited forward() — the base's dropout
+    rate was too aggressive for BSNIP's smaller dataset and contributed to
+    val_balanced_acc collapsing to 0.5 (majority-class-only predictions).
     """
 
     def __init__(self, input_shape: tuple[int, int, int], num_classes: int = NUM_CLASSES) -> None:
@@ -72,6 +77,7 @@ class BSNIP3DCNN(Simple3DCNN):
             x = self.pool3(F.relu(self.bn3(self.conv3(x))))
             flat_dim = x.view(1, -1).shape[1]
         self.fc1 = nn.Linear(flat_dim, 128)
+        self.dropout = nn.Dropout(p=0.4)
 
 
 def set_seed(seed: int) -> None:
@@ -185,8 +191,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--metadata-csv", type=Path, default=DEFAULT_METADATA_CSV,
                          help="Path to bsnip_preprocessed_npy_metadata.csv (default: %(default)s)")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs (default: %(default)s)")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size (default: %(default)s)")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Adam learning rate (default: %(default)s)")
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size (default: %(default)s)")
+    parser.add_argument("--lr", type=float, default=2e-5, help="Adam learning rate (default: %(default)s)")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker count (default: %(default)s)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed, also used for the data split (default: %(default)s)")
     parser.add_argument("--device", type=str, default=None, choices=["cuda", "cpu"],
@@ -226,7 +232,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     model = BSNIP3DCNN(input_shape=input_shape, num_classes=NUM_CLASSES).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
 
     init_log_csv(args.log_csv)
     best_metric = float("-inf") if args.checkpoint_metric == "val_auc" else float("inf")
@@ -250,6 +257,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             epoch, args.epochs, train_loss, train_metrics["acc"], train_metrics["balanced_acc"], train_metrics["auc"],
             val_loss, val_metrics["acc"], val_metrics["balanced_acc"], val_metrics["auc"],
         )
+
+        if not np.isnan(val_metrics["auc"]):
+            scheduler.step(val_metrics["auc"])
+        else:
+            logger.warning("Skipping LR scheduler step: val_auc is NaN this epoch")
 
         current_metric = val_metrics["auc"] if args.checkpoint_metric == "val_auc" else val_loss
         if not np.isnan(current_metric) and is_better(current_metric, best_metric, args.checkpoint_metric):
