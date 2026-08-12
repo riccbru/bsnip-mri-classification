@@ -34,6 +34,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+torch.backends.cudnn.enabled = False
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, roc_auc_score
 from torch.utils.data import DataLoader
 

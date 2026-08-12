@@ -11,9 +11,8 @@
 #SBATCH --mem=32G
 #SBATCH --time=04:00:00
 
-module load cuda/11.8
-#module load cuda/12.1
 source ~/.bashrc
 conda activate adni_rcc
 
+# Execute training
 python train_3dcnn.py --epochs 50 --batch-size 8 --lr 1e-4 --seed 42 --device cuda
