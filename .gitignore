@@ -13,6 +13,11 @@ __pycache__/
 *.nii
 *.nii.gz
 *.pth
+*.npy
+*.nii
+*.nii.gz
+/logs/
+data/bsnip_npy/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -28,3 +33,4 @@ unsloth_compiled_cache/
 DEV.md
 CLAUDE.md
 output.log
+.DS_Store
