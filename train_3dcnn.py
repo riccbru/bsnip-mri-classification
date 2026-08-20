@@ -35,7 +35,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 torch.backends.cudnn.enabled = False
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, roc_auc_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, f1_score, roc_auc_score
 from torch.utils.data import DataLoader
 
 from bsnip_dataset import LABEL_NAMES, get_bsnip_dataloaders
@@ -55,7 +55,7 @@ LOG_COLUMNS: list[str] = [
 
 
 class BSNIP3DCNN(Simple3DCNN):
-    """Simple3DCNN with a shape-adaptive fc1.
+    """Simple3DCNN with a shape-adaptive fc1, and an optional GAP head.
 
     ADNI volumes are resized to a fixed 128^3, so the base class's fc1 is
     hardcoded for that shape. BSNIP volumes keep their native preprocessed
@@ -66,18 +66,49 @@ class BSNIP3DCNN(Simple3DCNN):
     between fc1 and fc2 by the inherited forward() — the base's dropout
     rate was too aggressive for BSNIP's smaller dataset and contributed to
     val_balanced_acc collapsing to 0.5 (majority-class-only predictions).
+
+    If `use_gap=True`, conv3's output is global-average-pooled to
+    (C, 1, 1, 1) before fc1 instead of flattened — far fewer fc1 parameters
+    (32 vs. flatten's spatial-dim-dependent size) and less sensitivity to
+    where in the volume a feature appears, at the cost of discarding
+    positional information entirely. Off by default to preserve the
+    existing (flatten-based) architecture and its trained checkpoints.
     """
 
-    def __init__(self, input_shape: tuple[int, int, int], num_classes: int = NUM_CLASSES) -> None:
+    def __init__(
+        self,
+        input_shape: tuple[int, int, int],
+        num_classes: int = NUM_CLASSES,
+        use_gap: bool = False,
+    ) -> None:
         super().__init__(num_classes=num_classes)
-        with torch.no_grad():
-            dummy = torch.zeros(1, 1, *input_shape)
-            x = self.pool1(F.relu(self.bn1(self.conv1(dummy))))
-            x = self.pool2(F.relu(self.bn2(self.conv2(x))))
-            x = self.pool3(F.relu(self.bn3(self.conv3(x))))
-            flat_dim = x.view(1, -1).shape[1]
+        self.use_gap = use_gap
+
+        if use_gap:
+            self.gap = nn.AdaptiveAvgPool3d((1, 1, 1))
+            flat_dim = 32  # conv3's output channel count
+        else:
+            self.gap = None
+            with torch.no_grad():
+                dummy = torch.zeros(1, 1, *input_shape)
+                x = self.pool1(F.relu(self.bn1(self.conv1(dummy))))
+                x = self.pool2(F.relu(self.bn2(self.conv2(x))))
+                x = self.pool3(F.relu(self.bn3(self.conv3(x))))
+                flat_dim = x.view(1, -1).shape[1]
+
         self.fc1 = nn.Linear(flat_dim, 128)
         self.dropout = nn.Dropout(p=0.4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool1(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool2(F.relu(self.bn2(self.conv2(x))))
+        x = self.pool3(F.relu(self.bn3(self.conv3(x))))
+        if self.use_gap:
+            x = self.gap(x)
+        x = x.view(x.size(0), -1)
+        x = self.dropout(F.relu(self.fc1(x)))
+        x = self.fc2(x)
+        return x
 
 
 def set_seed(seed: int) -> None:
@@ -93,6 +124,18 @@ def infer_input_shape(loader: DataLoader) -> tuple[int, int, int]:
     """Read the (D, H, W) shape of one sample from a DataLoader's dataset."""
     sample_img, _ = loader.dataset[0]
     return tuple(sample_img.shape[1:])  # drop channel dim: (1, D, H, W) -> (D, H, W)
+
+
+def compute_class_weights(labels: Sequence[int], num_classes: int = NUM_CLASSES) -> torch.Tensor:
+    """Inverse class-frequency weights for nn.CrossEntropyLoss(weight=...).
+
+    weight[c] = n_samples / (n_classes * n_samples_in_class_c), the standard
+    "balanced" weighting — rarer classes get proportionally larger weight.
+    """
+    counts = np.bincount(np.asarray(labels, dtype=int), minlength=num_classes).astype(np.float64)
+    counts = np.where(counts == 0, 1.0, counts)  # avoid div-by-zero if a class is absent
+    weights = counts.sum() / (num_classes * counts)
+    return torch.tensor(weights, dtype=torch.float32)
 
 
 def compute_metrics(y_true: Sequence[int], y_pred: Sequence[int], y_prob: Sequence[float]) -> dict[str, float]:
@@ -169,21 +212,79 @@ def append_log_row(log_csv: Path, row: dict[str, float]) -> None:
         csv.writer(f).writerow([row[col] for col in LOG_COLUMNS])
 
 
-def evaluate_test_set(model: nn.Module, test_loader: DataLoader, device: torch.device) -> None:
-    """Final evaluation of the best checkpoint on the held-out test split."""
+def collect_probs(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple[list[int], list[float]]:
+    """Collect true labels and predicted P(SZ) probabilities for every sample in `loader`."""
     model.eval()
     y_true: list[int] = []
-    y_pred: list[int] = []
+    y_prob: list[float] = []
     with torch.no_grad():
-        for images, labels in test_loader:
+        for images, labels in loader:
             images = images.to(device)
             logits = model(images)
-            preds = torch.argmax(logits, dim=1)
+            probs = torch.softmax(logits, dim=1)[:, 1]
             y_true.extend(labels.tolist())
-            y_pred.extend(preds.cpu().tolist())
+            y_prob.extend(probs.cpu().tolist())
+    return y_true, y_prob
 
-    target_names = [LABEL_NAMES[i] for i in sorted(set(y_true) | set(y_pred))]
-    logger.info("Test set classification report:\n%s", classification_report(y_true, y_pred, target_names=target_names))
+
+def find_optimal_threshold(
+    y_true: Sequence[int], y_prob: Sequence[float], metric: str = "balanced_accuracy",
+) -> tuple[float, float]:
+    """Grid-search over [0.1, 0.9] for the decision threshold maximizing `metric` on (y_true, y_prob)."""
+    def score_fn(yt: Sequence[int], preds: np.ndarray) -> float:
+        if metric == "macro_f1":
+            return f1_score(yt, preds, average="macro", zero_division=0)
+        return balanced_accuracy_score(yt, preds)
+
+    y_prob_arr = np.asarray(y_prob)
+    best_threshold, best_score = 0.5, -1.0
+    for threshold in np.arange(0.1, 0.91, 0.01):
+        preds = (y_prob_arr >= threshold).astype(int)
+        score = score_fn(y_true, preds)
+        if score > best_score:
+            best_score, best_threshold = score, float(threshold)
+    return best_threshold, best_score
+
+
+def evaluate_at_threshold(y_true: Sequence[int], y_prob: Sequence[float], threshold: float) -> dict[str, float]:
+    """Accuracy, balanced accuracy, and macro F1 at a given decision threshold."""
+    preds = (np.asarray(y_prob) >= threshold).astype(int)
+    return {
+        "acc": accuracy_score(y_true, preds),
+        "balanced_acc": balanced_accuracy_score(y_true, preds),
+        "macro_f1": f1_score(y_true, preds, average="macro", zero_division=0),
+    }
+
+
+def evaluate_test_set(
+    model: nn.Module,
+    val_loader: DataLoader,
+    test_loader: DataLoader,
+    device: torch.device,
+    threshold_metric: str = "balanced_accuracy",
+) -> None:
+    """Tune the decision threshold p* on val, then evaluate test at both 0.5 and p*.
+
+    p* is grid-searched over [0.1, 0.9] on validation-set probabilities to
+    maximize `threshold_metric` (balanced_accuracy or macro_f1), then
+    applied to the test set alongside the default 0.5 threshold so the two
+    can be compared directly.
+    """
+    val_true, val_prob = collect_probs(model, val_loader, device)
+    best_threshold, best_val_score = find_optimal_threshold(val_true, val_prob, metric=threshold_metric)
+    logger.info("Optimal threshold p*=%.2f (val %s=%.4f)", best_threshold, threshold_metric, best_val_score)
+
+    test_true, test_prob = collect_probs(model, test_loader, device)
+
+    for threshold, label in [(0.5, "default (p=0.50)"), (best_threshold, f"tuned (p*={best_threshold:.2f})")]:
+        metrics = evaluate_at_threshold(test_true, test_prob, threshold)
+        preds = (np.asarray(test_prob) >= threshold).astype(int)
+        target_names = [LABEL_NAMES[i] for i in sorted(set(test_true) | set(preds.tolist()))]
+        logger.info(
+            "Test set @ %s -> acc=%.4f balanced_acc=%.4f macro_f1=%.4f\n%s",
+            label, metrics["acc"], metrics["balanced_acc"], metrics["macro_f1"],
+            classification_report(test_true, preds, target_names=target_names),
+        )
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -199,6 +300,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                          help="Device to train on (default: cuda if available, else cpu)")
     parser.add_argument("--checkpoint-metric", type=str, default="val_auc", choices=["val_auc", "val_loss"],
                          help="Metric used to select the best checkpoint (default: %(default)s)")
+    parser.add_argument("--use-gap", action="store_true",
+                         help="Use global average pooling before fc1 instead of flattening conv3's "
+                              "output (fewer params, less positional overfitting) (default: %(default)s)")
+    parser.add_argument("--threshold-metric", type=str, default="balanced_accuracy",
+                         choices=["balanced_accuracy", "macro_f1"],
+                         help="Metric to maximize when tuning the test-set decision threshold on val "
+                              "(default: %(default)s)")
     parser.add_argument("--checkpoint-path", type=Path, default=DEFAULT_CHECKPOINT_PATH,
                          help="Where to save the best model checkpoint (default: %(default)s)")
     parser.add_argument("--log-csv", type=Path, default=DEFAULT_LOG_CSV,
@@ -230,8 +338,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     input_shape = infer_input_shape(train_loader)
     logger.info("Inferred volume input shape (D, H, W): %s", input_shape)
 
-    model = BSNIP3DCNN(input_shape=input_shape, num_classes=NUM_CLASSES).to(device)
-    criterion = nn.CrossEntropyLoss()
+    train_labels = train_loader.dataset.data["label"].tolist()
+    class_weights = compute_class_weights(train_labels, NUM_CLASSES)
+    logger.info(
+        "Train class weights (inverse frequency): %s",
+        {LABEL_NAMES[i]: round(w, 4) for i, w in enumerate(class_weights.tolist())},
+    )
+
+    model = BSNIP3DCNN(input_shape=input_shape, num_classes=NUM_CLASSES, use_gap=args.use_gap).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
 
@@ -272,7 +387,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     logger.info("Training complete. Best %s: %.4f", args.checkpoint_metric, best_metric)
 
     model.load_state_dict(torch.load(args.checkpoint_path, map_location=device))
-    evaluate_test_set(model, test_loader, device)
+    evaluate_test_set(model, val_loader, test_loader, device, threshold_metric=args.threshold_metric)
 
 
 if __name__ == "__main__":
