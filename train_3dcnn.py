@@ -11,12 +11,26 @@ adapted to:
       fixed 128^3 (see preprocessing.py), so the base class's hardcoded
       32*16*16*16 flatten size would break on BSNIP's native volume shape.
 
-Everything about a run is keyed off --exp-name: every output goes to
-runs/<exp_name>/ (auto-created) with no other path flags to manage:
-    - best_model.pth           best checkpoint (by --checkpoint-metric)
-    - training_log.csv         per-epoch Loss/Accuracy/Balanced Acc/AUC-ROC
-    - training_curves.png      Loss + AUC curves, plotted at the end
-    - experiment_summary.json  hyperparams + best val metrics + test metrics
+Two modes, both keyed off --exp-name (outputs always land under
+runs/<exp_name>/, auto-created, no other path flags to manage):
+
+    Single-split (default, --cv-folds 0): one train/val/test run.
+        runs/<exp_name>/best_model.pth
+        runs/<exp_name>/training_log.csv
+        runs/<exp_name>/training_curves.png
+        runs/<exp_name>/experiment_summary.json
+
+    K-fold cross-validation (--cv-folds > 1): bsnip_dataset.get_bsnip_cv_folds()
+    builds K stratified (Train, Inner-Val, Outer-Test) splits. Each fold is
+    trained/evaluated independently (best checkpoint by peak Inner-Val AUC,
+    threshold p* tuned on Inner-Val, Outer-Test evaluated at 0.5 and p*):
+        runs/<exp_name>/fold_<k>/best_model.pth
+        runs/<exp_name>/fold_<k>/training_log.csv
+        runs/<exp_name>/fold_<k>/training_curves.png
+        runs/<exp_name>/fold_<k>/experiment_summary.json
+    plus, aggregated Out-Of-Fold (OOF) results across all K folds:
+        runs/<exp_name>/cv_summary.json   (mean +/- std per metric)
+        runs/<exp_name>/cv_roc_curves.png (per-fold ROC + mean ROC +/-1 std)
 
 Four boolean switches (--augment, --weighted-loss, --use-gap all default
 False; --tune-threshold defaults True) toggle: on-the-fly 3D train
@@ -25,8 +39,13 @@ flatten, and val-tuned decision-threshold evaluation on top of the default
 p=0.5. Each also accepts a --no-<flag> form (e.g. --no-tune-threshold).
 
 Usage:
+    # Single split (default)
     python train_3dcnn.py --exp-name v3_gap --epochs 50 --batch-size 4 --lr 2e-5 \\
         --seed 42 --device cuda --augment --weighted-loss --use-gap
+
+    # 5-fold cross-validation
+    python train_3dcnn.py --exp-name v6_cv5 --cv-folds 5 --epochs 50 \\
+        --batch-size 4 --lr 2e-5 --seed 42 --device cuda --augment --use-gap
 """
 
 from __future__ import annotations
@@ -50,15 +69,17 @@ import torch.nn.functional as F
 torch.backends.cudnn.enabled = False
 from sklearn.metrics import (
     accuracy_score,
+    auc,
     balanced_accuracy_score,
     classification_report,
     f1_score,
     precision_recall_fscore_support,
     roc_auc_score,
+    roc_curve,
 )
 from torch.utils.data import DataLoader
 
-from bsnip_dataset import LABEL_NAMES, get_bsnip_dataloaders
+from bsnip_dataset import LABEL_NAMES, get_bsnip_cv_folds, get_bsnip_dataloaders
 from logging_utils import setup_logging
 from model_3dcnn import Simple3DCNN
 
@@ -70,6 +91,8 @@ BEST_MODEL_FILENAME = "best_model.pth"
 LOG_CSV_FILENAME = "training_log.csv"
 CURVES_FILENAME = "training_curves.png"
 SUMMARY_FILENAME = "experiment_summary.json"
+CV_SUMMARY_FILENAME = "cv_summary.json"
+CV_ROC_FILENAME = "cv_roc_curves.png"
 
 NUM_CLASSES = 2  # (HC, SZ) = (0, 1)
 LOG_COLUMNS: list[str] = [
@@ -384,12 +407,15 @@ def evaluate_test_set(
 ) -> dict[str, object]:
     """Evaluate test at p=0.5, and (if tune_threshold) also at a val-tuned p*.
 
+    "val_loader"/"test_loader" here are whichever pair the caller is
+    evaluating on — the single-split val/test loaders, or a CV fold's
+    inner-val/outer-test loaders; this function doesn't know or care which.
+
     Logs a per-class classification_report for each threshold evaluated,
     prints the compact comparison table, and returns a JSON-able summary
-    dict for experiment_summary.json — each threshold's entry includes both
-    the macro-averaged metrics and a "per_class" breakdown (precision,
-    recall, f1-score, support for HC and SZ, from
-    classification_report(output_dict=True)).
+    dict — each threshold's entry includes both the macro-averaged metrics
+    and a "per_class" breakdown (precision, recall, f1-score, support for
+    HC and SZ, from classification_report(output_dict=True)).
     """
     test_true, test_prob = collect_probs(model, test_loader, device)
 
@@ -442,6 +468,357 @@ def _json_safe(value: object) -> object:
     return value
 
 
+def train_one_split(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    output_dir: Path,
+    epochs: int,
+    lr: float,
+    checkpoint_metric: str,
+    weighted_loss: bool,
+    log_tag: str = "",
+) -> tuple[Path, list[dict[str, float]], dict[str, float]]:
+    """Train `model` on (train_loader, val_loader) for `epochs`, writing
+    best_model.pth / training_log.csv / training_curves.png into output_dir.
+
+    Shared by both the single-split path (--cv-folds 0) and each fold of
+    the cross-validation path (--cv-folds > 1) — `val_loader` there is a
+    fold's Inner-Val loader, so "New best checkpoint" selection is always
+    based on validation data the outer test set never touches.
+
+    `log_tag` (e.g. "[fold 2/5] ") is prefixed onto this function's log
+    lines for readability inside a CV loop; empty in single-split mode.
+
+    Returns (checkpoint_path, epoch_history, best_val_summary).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / BEST_MODEL_FILENAME
+    log_csv_path = output_dir / LOG_CSV_FILENAME
+    curves_path = output_dir / CURVES_FILENAME
+
+    if weighted_loss:
+        train_labels = train_loader.dataset.data["label"].tolist()
+        class_weights = compute_class_weights(train_labels, NUM_CLASSES)
+        logger.info(
+            "%sWeighted loss enabled — class weights (inverse frequency): %s",
+            log_tag, {LABEL_NAMES[i]: round(w, 4) for i, w in enumerate(class_weights.tolist())},
+        )
+        criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+    else:
+        logger.info("%sWeighted loss disabled — using unweighted CrossEntropyLoss", log_tag)
+        criterion = nn.CrossEntropyLoss()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
+
+    init_log_csv(log_csv_path)
+    history: list[dict[str, float]] = []
+    best_metric = float("-inf") if checkpoint_metric == "val_auc" else float("inf")
+    best_val_summary: dict[str, float] = {}
+
+    for epoch in range(1, epochs + 1):
+        train_loss, train_metrics = run_epoch(model, train_loader, criterion, device, optimizer)
+        val_loss, val_metrics = run_epoch(model, val_loader, criterion, device, optimizer=None)
+
+        row = {
+            "epoch": epoch,
+            "train_loss": train_loss, "train_acc": train_metrics["acc"],
+            "train_balanced_acc": train_metrics["balanced_acc"], "train_auc": train_metrics["auc"],
+            "val_loss": val_loss, "val_acc": val_metrics["acc"],
+            "val_balanced_acc": val_metrics["balanced_acc"], "val_auc": val_metrics["auc"],
+        }
+        append_log_row(log_csv_path, row)
+        history.append(row)
+
+        logger.info(
+            "%sEpoch [%d/%d] train_loss=%.4f train_acc=%.4f train_bal_acc=%.4f train_auc=%.4f | "
+            "val_loss=%.4f val_acc=%.4f val_bal_acc=%.4f val_auc=%.4f",
+            log_tag, epoch, epochs, train_loss, train_metrics["acc"], train_metrics["balanced_acc"], train_metrics["auc"],
+            val_loss, val_metrics["acc"], val_metrics["balanced_acc"], val_metrics["auc"],
+        )
+
+        if not np.isnan(val_metrics["auc"]):
+            scheduler.step(val_metrics["auc"])
+        else:
+            logger.warning("%sSkipping LR scheduler step: val_auc is NaN this epoch", log_tag)
+
+        current_metric = val_metrics["auc"] if checkpoint_metric == "val_auc" else val_loss
+        if not np.isnan(current_metric) and is_better(current_metric, best_metric, checkpoint_metric):
+            best_metric = current_metric
+            best_val_summary = {"epoch": epoch, "val_loss": val_loss, **val_metrics}
+            torch.save(model.state_dict(), checkpoint_path)
+            logger.info("%sNew best checkpoint (%s=%.4f) saved to %s", log_tag, checkpoint_metric, best_metric, checkpoint_path)
+
+    logger.info("%sTraining complete. Best %s: %.4f", log_tag, checkpoint_metric, best_metric)
+    make_and_save_curves(history, curves_path)
+
+    return checkpoint_path, history, best_val_summary
+
+
+def _mean_std(values: Sequence[float]) -> dict[str, float]:
+    """{"mean", "std"} over `values`, ignoring NaNs (e.g. an undefined per-fold AUC)."""
+    arr = np.asarray(values, dtype=float)
+    return {"mean": float(np.nanmean(arr)), "std": float(np.nanstd(arr))}
+
+
+def aggregate_oof_metrics(fold_results: list[dict[str, object]]) -> dict[str, object]:
+    """Out-Of-Fold (OOF) mean +/- std across folds.
+
+    Aggregates the threshold-independent AUC-ROC (each fold's
+    outer_test_auc), and, per threshold condition evaluated (Default p=0.5,
+    and Tuned p* if --tune-threshold), Balanced Accuracy, Macro F1, HC
+    Recall, SZ Recall, and the full per-class precision/recall/f1-score.
+
+    Threshold conditions are matched across folds by *position*
+    (evaluate_test_set's first entry is always "Default (p=0.50)", second —
+    if present — is always the tuned one) rather than by dict key, since
+    each fold's tuned threshold has a different numeric value baked into
+    its key (e.g. "Tuned (p*=0.47)" vs "Tuned (p*=0.52)").
+    """
+    n_folds = len(fold_results)
+    aucs = [fr["outer_test_auc"] for fr in fold_results]
+
+    n_conditions = len(fold_results[0]["test"]["metrics_by_threshold"])
+    condition_names = ["Default (p=0.50)"]
+    if n_conditions > 1:
+        condition_names.append("Tuned (p*)")
+
+    by_threshold: dict[str, object] = {}
+    for pos, condition_name in enumerate(condition_names):
+        balanced_accs, macro_f1s, hc_recalls, sz_recalls = [], [], [], []
+        per_class_values: dict[str, dict[str, list[float]]] = {
+            name: {"precision": [], "recall": [], "f1_score": []} for name in LABEL_NAMES.values()
+        }
+
+        for fr in fold_results:
+            entries = list(fr["test"]["metrics_by_threshold"].values())
+            m = entries[pos]
+            balanced_accs.append(m["balanced_acc"])
+            macro_f1s.append(m["f1_macro"])
+            hc_recalls.append(m["per_class"].get("HC", {}).get("recall", float("nan")))
+            sz_recalls.append(m["per_class"].get("SZ", {}).get("recall", float("nan")))
+            for name, buckets in per_class_values.items():
+                cls = m["per_class"].get(name)
+                if cls is not None:
+                    for key in buckets:
+                        buckets[key].append(cls[key])
+
+        by_threshold[condition_name] = {
+            "balanced_acc": _mean_std(balanced_accs),
+            "macro_f1": _mean_std(macro_f1s),
+            "hc_recall": _mean_std(hc_recalls),
+            "sz_recall": _mean_std(sz_recalls),
+            "per_class": {
+                name: {key: _mean_std(vals) for key, vals in metrics.items()}
+                for name, metrics in per_class_values.items()
+            },
+        }
+
+    return {
+        "n_folds": n_folds,
+        "auc": _mean_std(aucs),
+        "by_threshold": by_threshold,
+    }
+
+
+def print_oof_table(oof: dict[str, object]) -> None:
+    """Print a compact Out-Of-Fold mean +/- std summary to stdout."""
+    width = 70
+    print("\n" + "=" * width)
+    print(f"Out-Of-Fold (OOF) Summary across {oof['n_folds']} folds")
+    print("=" * width)
+    print(f"AUC-ROC:        {oof['auc']['mean']:.4f} +/- {oof['auc']['std']:.4f}")
+    for condition, m in oof["by_threshold"].items():
+        print(f"\n-- {condition} --")
+        print(f"  Balanced Acc: {m['balanced_acc']['mean']:.4f} +/- {m['balanced_acc']['std']:.4f}")
+        print(f"  Macro F1:     {m['macro_f1']['mean']:.4f} +/- {m['macro_f1']['std']:.4f}")
+        print(f"  HC Recall:    {m['hc_recall']['mean']:.4f} +/- {m['hc_recall']['std']:.4f}")
+        print(f"  SZ Recall:    {m['sz_recall']['mean']:.4f} +/- {m['sz_recall']['std']:.4f}")
+    print("=" * width + "\n")
+
+
+def plot_cv_roc_curves(fold_roc_data: list[tuple[np.ndarray, np.ndarray, float]], output_path: Path) -> None:
+    """Plot every fold's ROC curve plus the mean ROC (+/- 1 std band).
+
+    Standard scikit-learn cross-validation ROC recipe: each fold's TPR is
+    linearly interpolated onto a common FPR grid before averaging, so folds
+    with different outer-test sizes/thresholds-per-curve can be combined.
+    """
+    mean_fpr = np.linspace(0, 1, 100)
+    interpolated_tprs = []
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    for fold_idx, (fpr, tpr, fold_auc) in enumerate(fold_roc_data, start=1):
+        ax.plot(fpr, tpr, alpha=0.35, linewidth=1.2, label=f"Fold {fold_idx} (AUC={fold_auc:.3f})")
+        interp_tpr = np.interp(mean_fpr, fpr, tpr)
+        interp_tpr[0] = 0.0
+        interpolated_tprs.append(interp_tpr)
+
+    mean_tpr = np.mean(interpolated_tprs, axis=0)
+    mean_tpr[-1] = 1.0
+    mean_auc = auc(mean_fpr, mean_tpr)
+    std_tpr = np.std(interpolated_tprs, axis=0)
+    std_auc = float(np.std([fold_auc for _, _, fold_auc in fold_roc_data]))
+
+    ax.plot(
+        mean_fpr, mean_tpr, color="navy", linewidth=2.5,
+        label=f"Mean ROC (AUC={mean_auc:.3f} $\\pm$ {std_auc:.3f})",
+    )
+    upper = np.minimum(mean_tpr + std_tpr, 1)
+    lower = np.maximum(mean_tpr - std_tpr, 0)
+    ax.fill_between(mean_fpr, lower, upper, color="navy", alpha=0.15, label="$\\pm$ 1 std. dev.")
+
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1, label="Chance")
+    ax.set_xlim(-0.01, 1.01)
+    ax.set_ylim(-0.01, 1.01)
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title(f"BSNIP {len(fold_roc_data)}-Fold CV ROC (Outer Test)")
+    ax.legend(loc="lower right", fontsize=8, frameon=False)
+    ax.grid(alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved CV ROC curves to %s", output_path)
+
+
+def run_single_split(args: argparse.Namespace, exp_name: str, exp_dir: Path, device: torch.device) -> None:
+    """Standard single train/val/test run (--cv-folds 0 or 1)."""
+    summary_path = exp_dir / SUMMARY_FILENAME
+
+    train_loader, val_loader, test_loader = get_bsnip_dataloaders(
+        metadata_csv=args.metadata_csv,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        random_state=args.seed,
+        augment=args.augment,
+    )
+    logger.info(
+        "Split sizes -> train: %d, val: %d, test: %d",
+        len(train_loader.dataset), len(val_loader.dataset), len(test_loader.dataset),
+    )
+    logger.info("Train augmentation: %s", args.augment)
+
+    input_shape = infer_input_shape(train_loader)
+    logger.info("Inferred volume input shape (D, H, W): %s", input_shape)
+
+    model = BSNIP3DCNN(input_shape=input_shape, num_classes=NUM_CLASSES, use_gap=args.use_gap).to(device)
+
+    checkpoint_path, _history, best_val_summary = train_one_split(
+        model, train_loader, val_loader, device, exp_dir,
+        args.epochs, args.lr, args.checkpoint_metric, args.weighted_loss,
+    )
+
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    test_summary = evaluate_test_set(
+        model, val_loader, test_loader, device,
+        tune_threshold=args.tune_threshold, threshold_metric=args.threshold_metric,
+    )
+
+    summary = {
+        "exp_name": exp_name,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "hyperparameters": {k: _json_safe(v) for k, v in vars(args).items()},
+        "best_val": best_val_summary,
+        "test": test_summary,
+    }
+    with summary_path.open("w") as f:
+        json.dump(summary, f, indent=2)
+    logger.info("Saved experiment summary to %s", summary_path)
+
+
+def run_cross_validation(args: argparse.Namespace, exp_name: str, exp_dir: Path, device: torch.device) -> None:
+    """Stratified K-fold cross-validation (--cv-folds > 1).
+
+    Each fold trains and selects its own best checkpoint from its own
+    Inner-Val split, tunes its own threshold p* on that same Inner-Val
+    split, and evaluates once on its own Outer-Test split — which that
+    fold's training/model-selection/threshold-tuning never sees. Fold
+    artifacts land in runs/<exp_name>/fold_<k>/; aggregated Out-Of-Fold
+    results land in runs/<exp_name>/{cv_summary.json, cv_roc_curves.png}.
+    """
+    folds = get_bsnip_cv_folds(
+        metadata_csv=args.metadata_csv,
+        cv_folds=args.cv_folds,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        random_state=args.seed,
+        augment=args.augment,
+    )
+
+    fold_results: list[dict[str, object]] = []
+    roc_data: list[tuple[np.ndarray, np.ndarray, float]] = []
+
+    for fold_idx, (train_loader, inner_val_loader, outer_test_loader) in enumerate(folds, start=1):
+        log_tag = f"[fold {fold_idx}/{args.cv_folds}] "
+        fold_dir = exp_dir / f"fold_{fold_idx}"
+        logger.info(
+            "%sTrain: %d, Inner-Val: %d, Outer-Test: %d",
+            log_tag, len(train_loader.dataset), len(inner_val_loader.dataset), len(outer_test_loader.dataset),
+        )
+
+        input_shape = infer_input_shape(train_loader)
+        model = BSNIP3DCNN(input_shape=input_shape, num_classes=NUM_CLASSES, use_gap=args.use_gap).to(device)
+
+        checkpoint_path, _history, best_val_summary = train_one_split(
+            model, train_loader, inner_val_loader, device, fold_dir,
+            args.epochs, args.lr, args.checkpoint_metric, args.weighted_loss, log_tag=log_tag,
+        )
+
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        test_summary = evaluate_test_set(
+            model, inner_val_loader, outer_test_loader, device,
+            tune_threshold=args.tune_threshold, threshold_metric=args.threshold_metric,
+        )
+
+        outer_true, outer_prob = collect_probs(model, outer_test_loader, device)
+        fpr, tpr, _ = roc_curve(outer_true, outer_prob)
+        fold_auc = float(auc(fpr, tpr))
+        roc_data.append((fpr, tpr, fold_auc))
+
+        fold_summary = {
+            "fold": fold_idx,
+            "best_val": best_val_summary,
+            "outer_test_auc": fold_auc,
+            "test": test_summary,
+        }
+        fold_results.append(fold_summary)
+
+        fold_summary_path = fold_dir / SUMMARY_FILENAME
+        with fold_summary_path.open("w") as f:
+            json.dump(
+                {
+                    "exp_name": exp_name,
+                    "fold": fold_idx,
+                    "n_folds": args.cv_folds,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    **fold_summary,
+                },
+                f, indent=2,
+            )
+        logger.info("%sOuter-test AUC=%.4f | saved fold summary to %s", log_tag, fold_auc, fold_summary_path)
+
+    oof = aggregate_oof_metrics(fold_results)
+    print_oof_table(oof)
+    plot_cv_roc_curves(roc_data, exp_dir / CV_ROC_FILENAME)
+
+    cv_summary_path = exp_dir / CV_SUMMARY_FILENAME
+    cv_summary = {
+        "exp_name": exp_name,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "cv_folds": args.cv_folds,
+        "hyperparameters": {k: _json_safe(v) for k, v in vars(args).items()},
+        "folds": fold_results,
+        "oof": oof,
+    }
+    with cv_summary_path.open("w") as f:
+        json.dump(cv_summary, f, indent=2)
+    logger.info("Saved CV summary to %s", cv_summary_path)
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a 3D CNN on BSNIP HC vs SZ classification.")
     parser.add_argument("--exp-name", type=str, default=None,
@@ -449,6 +826,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                               "Defaults to a timestamp (run_YYYYmmdd_HHMMSS) if omitted.")
     parser.add_argument("--metadata-csv", type=Path, default=DEFAULT_METADATA_CSV,
                          help="Path to bsnip_preprocessed_npy_metadata.csv (default: %(default)s)")
+    parser.add_argument("--cv-folds", type=int, default=0,
+                         help="Number of stratified CV folds. 0 or 1 = standard single "
+                              "train/val/test split (default). >1 triggers K-fold "
+                              "cross-validation instead (default: %(default)s)")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs (default: %(default)s)")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size (default: %(default)s)")
     parser.add_argument("--lr", type=float, default=2e-5, help="Adam learning rate (default: %(default)s)")
@@ -457,10 +838,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None, choices=["cuda", "cpu"],
                          help="Device to train on (default: cuda if available, else cpu)")
     parser.add_argument("--checkpoint-metric", type=str, default="val_auc", choices=["val_auc", "val_loss"],
-                         help="Metric used to select the best checkpoint (default: %(default)s)")
+                         help="Metric used to select each split/fold's best checkpoint (default: %(default)s)")
     parser.add_argument("--threshold-metric", type=str, default="balanced_accuracy",
                          choices=["balanced_accuracy", "macro_f1"],
-                         help="Metric to maximize when tuning the test-set decision threshold on val "
+                         help="Metric to maximize when tuning the decision threshold on val "
                               "(default: %(default)s)")
 
     # Feature switches. Each also accepts a --no-<flag> form.
@@ -487,106 +868,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     exp_name = args.exp_name or datetime.now().strftime("run_%Y%m%d_%H%M%S")
     exp_dir = RUNS_DIR / exp_name
     exp_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = exp_dir / BEST_MODEL_FILENAME
-    log_csv_path = exp_dir / LOG_CSV_FILENAME
-    curves_path = exp_dir / CURVES_FILENAME
-    summary_path = exp_dir / SUMMARY_FILENAME
     logger.info("Experiment '%s' -> outputs in %s", exp_name, exp_dir)
 
     set_seed(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     logger.info("Using device: %s", device)
 
-    train_loader, val_loader, test_loader = get_bsnip_dataloaders(
-        metadata_csv=args.metadata_csv,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        random_state=args.seed,
-        augment=args.augment,
-    )
-    logger.info(
-        "Split sizes -> train: %d, val: %d, test: %d",
-        len(train_loader.dataset), len(val_loader.dataset), len(test_loader.dataset),
-    )
-    logger.info("Train augmentation: %s", args.augment)
-
-    input_shape = infer_input_shape(train_loader)
-    logger.info("Inferred volume input shape (D, H, W): %s", input_shape)
-
-    if args.weighted_loss:
-        train_labels = train_loader.dataset.data["label"].tolist()
-        class_weights = compute_class_weights(train_labels, NUM_CLASSES)
-        logger.info(
-            "Weighted loss enabled — class weights (inverse frequency): %s",
-            {LABEL_NAMES[i]: round(w, 4) for i, w in enumerate(class_weights.tolist())},
-        )
-        criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+    if args.cv_folds > 1:
+        logger.info("Cross-validation mode: %d folds", args.cv_folds)
+        run_cross_validation(args, exp_name, exp_dir, device)
     else:
-        logger.info("Weighted loss disabled — using unweighted CrossEntropyLoss")
-        criterion = nn.CrossEntropyLoss()
-
-    model = BSNIP3DCNN(input_shape=input_shape, num_classes=NUM_CLASSES, use_gap=args.use_gap).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
-
-    init_log_csv(log_csv_path)
-    history: list[dict[str, float]] = []
-    best_metric = float("-inf") if args.checkpoint_metric == "val_auc" else float("inf")
-    best_val_summary: dict[str, float] = {}
-
-    for epoch in range(1, args.epochs + 1):
-        train_loss, train_metrics = run_epoch(model, train_loader, criterion, device, optimizer)
-        val_loss, val_metrics = run_epoch(model, val_loader, criterion, device, optimizer=None)
-
-        row = {
-            "epoch": epoch,
-            "train_loss": train_loss, "train_acc": train_metrics["acc"],
-            "train_balanced_acc": train_metrics["balanced_acc"], "train_auc": train_metrics["auc"],
-            "val_loss": val_loss, "val_acc": val_metrics["acc"],
-            "val_balanced_acc": val_metrics["balanced_acc"], "val_auc": val_metrics["auc"],
-        }
-        append_log_row(log_csv_path, row)
-        history.append(row)
-
-        logger.info(
-            "Epoch [%d/%d] train_loss=%.4f train_acc=%.4f train_bal_acc=%.4f train_auc=%.4f | "
-            "val_loss=%.4f val_acc=%.4f val_bal_acc=%.4f val_auc=%.4f",
-            epoch, args.epochs, train_loss, train_metrics["acc"], train_metrics["balanced_acc"], train_metrics["auc"],
-            val_loss, val_metrics["acc"], val_metrics["balanced_acc"], val_metrics["auc"],
-        )
-
-        if not np.isnan(val_metrics["auc"]):
-            scheduler.step(val_metrics["auc"])
-        else:
-            logger.warning("Skipping LR scheduler step: val_auc is NaN this epoch")
-
-        current_metric = val_metrics["auc"] if args.checkpoint_metric == "val_auc" else val_loss
-        if not np.isnan(current_metric) and is_better(current_metric, best_metric, args.checkpoint_metric):
-            best_metric = current_metric
-            best_val_summary = {"epoch": epoch, "val_loss": val_loss, **val_metrics}
-            torch.save(model.state_dict(), checkpoint_path)
-            logger.info("New best checkpoint (%s=%.4f) saved to %s", args.checkpoint_metric, best_metric, checkpoint_path)
-
-    logger.info("Training complete. Best %s: %.4f", args.checkpoint_metric, best_metric)
-
-    make_and_save_curves(history, curves_path)
-
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-    test_summary = evaluate_test_set(
-        model, val_loader, test_loader, device,
-        tune_threshold=args.tune_threshold, threshold_metric=args.threshold_metric,
-    )
-
-    summary = {
-        "exp_name": exp_name,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "hyperparameters": {k: _json_safe(v) for k, v in vars(args).items()},
-        "best_val": best_val_summary,
-        "test": test_summary,
-    }
-    with summary_path.open("w") as f:
-        json.dump(summary, f, indent=2)
-    logger.info("Saved experiment summary to %s", summary_path)
+        if args.cv_folds == 1:
+            logger.info("--cv-folds=1 has no effect; running the standard single train/val/test split")
+        run_single_split(args, exp_name, exp_dir, device)
 
 
 if __name__ == "__main__":

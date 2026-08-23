@@ -2,12 +2,23 @@
 
 PyTorch Dataset and DataLoader factory for the BSNIP HC vs SZ classification
 task. Mirrors adni_dataset.py, adapted to bsnip_preprocessed_npy_metadata.csv
-(columns: subject_id, site, label, nii_path, npy_path) with a stratified,
-subject-level 70/15/15 train/val/test split.
+(columns: subject_id, site, label, nii_path, npy_path).
+
+Two ways to get data:
+    - get_bsnip_dataloaders(): a single stratified, subject-level 70/15/15
+      train/val/test split (the default, backward-compatible path).
+    - get_bsnip_cv_folds(): stratified K-fold cross-validation. Each fold's
+      outer test portion is held out entirely for that fold; the remaining
+      K-1/K "trainval" pool is further split 80/20 into Train/Inner-Val.
+
+Note: this metadata schema only has a numeric `label` column (0=HC, 1=SZ),
+not a `diagnosis` string column — the composite CV stratum below is built
+from `label` (as a string) + `site`, not `diagnosis` + `site`.
 """
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from pathlib import Path
 from typing import Optional, Sequence, Union
@@ -16,11 +27,14 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy import ndimage
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.utils.data import DataLoader, Dataset
+
+logger = logging.getLogger("bsnip_dataset")
 
 DEFAULT_METADATA_CSV = Path("bsnip_preprocessed_npy_metadata.csv")
 LABEL_NAMES: dict[int, str] = {0: "HC", 1: "SZ"}
+DEFAULT_INNER_VAL_SIZE = 0.2
 
 AUGMENT_FLIP_PROB = 0.5
 AUGMENT_MAX_SHIFT_VOXELS = 2
@@ -121,6 +135,11 @@ def _seed_worker(worker_id: int) -> None:
     np.random.seed(worker_seed)
 
 
+def _load_subjects_table(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per subject_id, keeping label and site for stratification."""
+    return df[["subject_id", "label", "site"]].drop_duplicates(subset="subject_id").reset_index(drop=True)
+
+
 def _split_subject_ids(
     subjects: pd.DataFrame,
     val_size: float,
@@ -145,6 +164,70 @@ def _split_subject_ids(
     )
 
     return list(train_ids), list(val_ids), list(test_ids)
+
+
+def _build_composite_strata(subjects: pd.DataFrame) -> pd.Series:
+    """label__site composite stratum, e.g. "1_Chicago", for StratifiedKFold."""
+    return subjects["label"].astype(str) + "_" + subjects["site"].astype(str)
+
+
+def _split_cv_folds(
+    subjects: pd.DataFrame,
+    cv_folds: int,
+    inner_val_size: float,
+    random_state: int,
+) -> list[tuple[list[str], list[str], list[str]]]:
+    """Stratified K-fold subject-id split: (train_ids, inner_val_ids, outer_test_ids) per fold.
+
+    Outer split: StratifiedKFold over a composite label+site stratum, so
+    each fold's outer test portion is balanced on both diagnosis and
+    acquisition site — falls back to label-only stratification if any
+    label+site group has fewer members than cv_folds. This is checked
+    proactively (not via try/except): StratifiedKFold only *warns*, it
+    doesn't raise, when a stratum is smaller than n_splits (it only raises
+    for far more extreme cases, e.g. n_splits exceeding even the largest
+    class's count) — so relying on catching a ValueError would silently
+    never trigger the fallback for the realistic case this is meant to
+    guard against.
+
+    Inner split: each fold's K-1/K "trainval" pool is further split into
+    Train ((1-inner_val_size)) / Inner-Val (inner_val_size), stratified by
+    label. The outer test portion is never touched until final evaluation.
+    """
+    subject_ids = subjects["subject_id"].to_numpy()
+    labels = subjects["label"].to_numpy()
+    composite_strata = _build_composite_strata(subjects)
+
+    min_stratum_size = int(composite_strata.value_counts().min())
+    if min_stratum_size < cv_folds:
+        logger.warning(
+            "Smallest label+site stratum has only %d member(s), fewer than cv_folds=%d; "
+            "falling back to label-only stratification for the outer K-fold split",
+            min_stratum_size, cv_folds,
+        )
+        strata_for_split = labels
+    else:
+        logger.info("Outer %d-fold split stratified by label+site composite", cv_folds)
+        strata_for_split = composite_strata.to_numpy()
+
+    skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
+    splits = list(skf.split(subject_ids, strata_for_split))
+
+    folds: list[tuple[list[str], list[str], list[str]]] = []
+    for trainval_pos, outer_test_pos in splits:
+        trainval_ids = subject_ids[trainval_pos]
+        trainval_labels = labels[trainval_pos]
+        outer_test_ids = subject_ids[outer_test_pos].tolist()
+
+        train_ids, inner_val_ids = train_test_split(
+            trainval_ids,
+            test_size=inner_val_size,
+            stratify=trainval_labels,
+            random_state=random_state,
+        )
+        folds.append((list(train_ids), list(inner_val_ids), outer_test_ids))
+
+    return folds
 
 
 def get_bsnip_dataloaders(
@@ -177,7 +260,7 @@ def get_bsnip_dataloaders(
         (train_loader, val_loader, test_loader)
     """
     df = pd.read_csv(metadata_csv)
-    subjects = df[["subject_id", "label"]].drop_duplicates(subset="subject_id").reset_index(drop=True)
+    subjects = _load_subjects_table(df)
 
     train_ids, val_ids, test_ids = _split_subject_ids(subjects, val_size, test_size, random_state)
 
@@ -196,6 +279,72 @@ def get_bsnip_dataloaders(
     )
 
     return train_loader, val_loader, test_loader
+
+
+def get_bsnip_cv_folds(
+    metadata_csv: Union[str, Path] = DEFAULT_METADATA_CSV,
+    cv_folds: int = 5,
+    batch_size: int = 8,
+    num_workers: int = 4,
+    inner_val_size: float = DEFAULT_INNER_VAL_SIZE,
+    random_state: int = 42,
+    augment: bool = False,
+) -> list[tuple[DataLoader, DataLoader, DataLoader]]:
+    """Build stratified K-fold (Train, Inner-Val, Outer-Test) DataLoaders for BSNIP.
+
+    Each of the cv_folds folds gets its own outer test portion (via
+    StratifiedKFold over a label+site composite stratum — see
+    _split_cv_folds), held out entirely from that fold's training and
+    threshold tuning. The remaining K-1/K "trainval" pool for that fold is
+    further split into Train / Inner-Val (stratified by label,
+    inner_val_size fraction). A subject never appears in more than one role
+    within a fold, and every subject is some fold's outer test exactly once.
+
+    Args:
+        metadata_csv: Path to bsnip_preprocessed_npy_metadata.csv.
+        cv_folds: Number of stratified folds (K).
+        batch_size: DataLoader batch size (same for all loaders/folds).
+        num_workers: DataLoader worker count (same for all loaders/folds).
+        inner_val_size: Fraction of each fold's trainval pool held out for
+            Inner-Val (default 0.2, i.e. Train 80% / Inner-Val 20%).
+        random_state: Seed for reproducible splits.
+        augment: If True, enable on-the-fly 3D augmentation on each fold's
+            Train split only. Inner-Val and Outer-Test are always
+            unaugmented regardless of this flag.
+
+    Returns:
+        A list of length cv_folds of (train_loader, inner_val_loader,
+        outer_test_loader) tuples, one per fold.
+    """
+    df = pd.read_csv(metadata_csv)
+    subjects = _load_subjects_table(df)
+
+    fold_ids = _split_cv_folds(subjects, cv_folds, inner_val_size, random_state)
+
+    loaders: list[tuple[DataLoader, DataLoader, DataLoader]] = []
+    for fold_idx, (train_ids, inner_val_ids, outer_test_ids) in enumerate(fold_ids, start=1):
+        train_dataset = BSNIPDataset(df, subject_ids=train_ids, is_train=augment)
+        inner_val_dataset = BSNIPDataset(df, subject_ids=inner_val_ids, is_train=False)
+        outer_test_dataset = BSNIPDataset(df, subject_ids=outer_test_ids, is_train=False)
+
+        logger.info(
+            "Fold %d/%d -> train: %d, inner_val: %d, outer_test: %d",
+            fold_idx, cv_folds, len(train_dataset), len(inner_val_dataset), len(outer_test_dataset),
+        )
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, worker_init_fn=_seed_worker,
+        )
+        inner_val_loader = DataLoader(
+            inner_val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=_seed_worker,
+        )
+        outer_test_loader = DataLoader(
+            outer_test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=_seed_worker,
+        )
+
+        loaders.append((train_loader, inner_val_loader, outer_test_loader))
+
+    return loaders
 
 
 def _label_distribution(labels: Sequence[int]) -> dict[str, int]:
