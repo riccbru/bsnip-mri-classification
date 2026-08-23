@@ -1,0 +1,52 @@
+{
+  "exp_name": "bsnip_3dcnn_v5",
+  "created_at": "2026-08-23T15:56:12",
+  "hyperparameters": {
+    "exp_name": "bsnip_3dcnn_v5",
+    "metadata_csv": "bsnip_preprocessed_npy_metadata.csv",
+    "epochs": 50,
+    "batch_size": 4,
+    "lr": 0.0001,
+    "num_workers": 4,
+    "seed": 42,
+    "device": "cuda",
+    "checkpoint_metric": "val_auc",
+    "threshold_metric": "balanced_accuracy",
+    "augment": true,
+    "weighted_loss": false,
+    "use_gap": true,
+    "tune_threshold": true,
+    "log_level": "INFO"
+  },
+  "best_val": {
+    "epoch": 40,
+    "val_loss": 0.6679771145184835,
+    "acc": 0.7017543859649122,
+    "balanced_acc": 0.7125,
+    "auc": 0.78
+  },
+  "test": {
+    "tune_threshold": true,
+    "threshold_metric": "balanced_accuracy",
+    "optimal_threshold": 0.4999999999999998,
+    "optimal_threshold_val_score": 0.7125,
+    "metrics_by_threshold": {
+      "Default (p=0.50)": {
+        "threshold": 0.5,
+        "precision_macro": 0.6745426829268293,
+        "recall_macro": 0.643125,
+        "f1_macro": 0.6041666666666666,
+        "balanced_acc": 0.643125,
+        "acc": 0.6140350877192983
+      },
+      "Tuned (p*=0.50)": {
+        "threshold": 0.4999999999999998,
+        "precision_macro": 0.6745426829268293,
+        "recall_macro": 0.643125,
+        "f1_macro": 0.6041666666666666,
+        "balanced_acc": 0.643125,
+        "acc": 0.6140350877192983
+      }
+    }
+  }
+}
