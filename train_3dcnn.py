@@ -322,12 +322,30 @@ def find_optimal_threshold(
     return best_threshold, best_score
 
 
-def evaluate_at_threshold(y_true: Sequence[int], y_prob: Sequence[float], threshold: float) -> dict[str, float]:
-    """Precision/recall/F1 (macro), balanced accuracy, and overall accuracy at a threshold."""
+def evaluate_at_threshold(y_true: Sequence[int], y_prob: Sequence[float], threshold: float) -> dict[str, object]:
+    """Macro-averaged precision/recall/F1, balanced accuracy, and overall accuracy at a
+    threshold, plus the full per-class (HC/SZ) precision/recall/f1-score/support
+    breakdown from classification_report(output_dict=True).
+    """
     preds = (np.asarray(y_prob) >= threshold).astype(int)
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_true, preds, average="macro", zero_division=0,
     )
+
+    target_names = [LABEL_NAMES[i] for i in sorted(set(y_true) | set(preds.tolist()))]
+    report = classification_report(
+        y_true, preds, target_names=target_names, output_dict=True, zero_division=0,
+    )
+    per_class = {
+        name: {
+            "precision": float(report[name]["precision"]),
+            "recall": float(report[name]["recall"]),
+            "f1_score": float(report[name]["f1-score"]),
+            "support": int(report[name]["support"]),
+        }
+        for name in target_names
+    }
+
     return {
         "threshold": float(threshold),
         "precision_macro": float(precision),
@@ -335,10 +353,11 @@ def evaluate_at_threshold(y_true: Sequence[int], y_prob: Sequence[float], thresh
         "f1_macro": float(f1),
         "balanced_acc": float(balanced_accuracy_score(y_true, preds)),
         "acc": float(accuracy_score(y_true, preds)),
+        "per_class": per_class,
     }
 
 
-def print_comparison_table(results: dict[str, dict[str, float]]) -> None:
+def print_comparison_table(results: dict[str, dict[str, object]]) -> None:
     """Print a compact Default (p=0.5) vs Tuned (p*) metrics table to stdout."""
     header = f"{'Threshold':<22}{'Precision':>10}{'Recall':>10}{'F1':>10}{'Balanced Acc':>14}{'Overall Acc':>13}"
     width = len(header)
@@ -367,7 +386,10 @@ def evaluate_test_set(
 
     Logs a per-class classification_report for each threshold evaluated,
     prints the compact comparison table, and returns a JSON-able summary
-    dict for experiment_summary.json.
+    dict for experiment_summary.json — each threshold's entry includes both
+    the macro-averaged metrics and a "per_class" breakdown (precision,
+    recall, f1-score, support for HC and SZ, from
+    classification_report(output_dict=True)).
     """
     test_true, test_prob = collect_probs(model, test_loader, device)
 
@@ -386,12 +408,15 @@ def evaluate_test_set(
         )
         thresholds.append((optimal_threshold, f"Tuned (p*={optimal_threshold:.2f})"))
 
-    results: dict[str, dict[str, float]] = {}
+    results: dict[str, dict[str, object]] = {}
     for threshold, label in thresholds:
         metrics = evaluate_at_threshold(test_true, test_prob, threshold)
         results[label] = metrics
 
         preds = (np.asarray(test_prob) >= threshold).astype(int)
+        # Same label-int-sorted derivation evaluate_at_threshold used to build
+        # `per_class`, so ordering is guaranteed consistent (not relying on
+        # HC/SZ happening to also sort alphabetically the same way).
         target_names = [LABEL_NAMES[i] for i in sorted(set(test_true) | set(preds.tolist()))]
         logger.info(
             "Test set @ %s -> acc=%.4f balanced_acc=%.4f macro_f1=%.4f\n%s",
