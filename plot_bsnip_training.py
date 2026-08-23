@@ -25,6 +25,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
+from logging_utils import setup_logging
+
 logger = logging.getLogger("plot_bsnip_training")
 
 DEFAULT_LOG_CSV = Path("training_log_bsnip.csv")
@@ -105,7 +107,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s [%(levelname)s] %(message)s")
+    setup_logging(args.log_level)
 
     df = load_training_log(args.log_csv)
     fig = make_figure(df)

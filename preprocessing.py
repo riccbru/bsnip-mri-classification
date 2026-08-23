@@ -41,6 +41,8 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from logging_utils import setup_logging
+
 logger = logging.getLogger("preprocessing")
 
 DEFAULT_INPUT_CSV = Path("data/bsnip_binary_metadata.csv")
@@ -145,10 +147,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
+    setup_logging(args.log_level)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 

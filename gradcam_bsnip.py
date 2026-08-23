@@ -47,6 +47,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from bsnip_dataset import LABEL_NAMES, get_bsnip_dataloaders
+from logging_utils import setup_logging
 from train_3dcnn import NUM_CLASSES, RUNS_DIR, BSNIP3DCNN, infer_input_shape
 
 logger = logging.getLogger("gradcam_bsnip")
@@ -217,7 +218,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s [%(levelname)s] %(message)s")
+    setup_logging(args.log_level)
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     logger.info("Using device: %s", device)

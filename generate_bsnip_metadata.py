@@ -33,6 +33,8 @@ from typing import Optional, Sequence
 
 import pandas as pd
 
+from logging_utils import setup_logging
+
 logger = logging.getLogger("generate_bsnip_metadata")
 
 DEFAULT_RAW_DATA_ROOT = Path("/project/bonnietfleming/wenjie/BSNIP2_FINAL_wmr")
@@ -159,10 +161,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
+    setup_logging(args.log_level)
 
     df = load_manifest(args.manifest_csv)
     df = filter_quality_control(df)

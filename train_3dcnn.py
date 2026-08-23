@@ -59,6 +59,7 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader
 
 from bsnip_dataset import LABEL_NAMES, get_bsnip_dataloaders
+from logging_utils import setup_logging
 from model_3dcnn import Simple3DCNN
 
 logger = logging.getLogger("train_3dcnn")
@@ -456,7 +457,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s [%(levelname)s] %(message)s")
+    setup_logging(args.log_level)
 
     exp_name = args.exp_name or datetime.now().strftime("run_%Y%m%d_%H%M%S")
     exp_dir = RUNS_DIR / exp_name
