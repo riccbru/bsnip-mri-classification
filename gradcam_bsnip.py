@@ -1,7 +1,15 @@
 """gradcam_bsnip.py
 
-Generate 3D Grad-CAM saliency maps for the trained BSNIP HC vs SZ 3D CNN
-(best_bsnip_3dcnn.pth), mirroring gradcam_visualize.py / model_3dcnn_gradcam.py.
+Generate 3D Grad-CAM saliency maps for a trained BSNIP HC vs SZ 3D CNN,
+mirroring gradcam_visualize.py / model_3dcnn_gradcam.py.
+
+Follows train_3dcnn.py's --exp-name convention: pass --exp-name v3_gap and
+this automatically loads runs/v3_gap/best_model.pth, saves figures to
+runs/v3_gap/gradcam_results/, and reads whether that run used a GAP head
+from runs/v3_gap/experiment_summary.json. --model-path, --output-dir, and
+--use-gap are manual overrides that take precedence over anything derived
+from --exp-name; without --exp-name at all, everything falls back to the
+pre-runs/ top-level defaults.
 
 For a sample of test-set subjects (default 5 HC + 5 SZ, from the same
 subject-level split get_bsnip_dataloaders() produces at --seed), this:
@@ -12,8 +20,7 @@ subject-level split get_bsnip_dataloaders() produces at --seed), this:
        it to [0, 1], and trilinearly resizes it to the input volume's native
        shape (121, 145, 121) for BSNIP's SPM12-normalized Grey Matter maps).
     4. Renders Axial / Coronal / Sagittal mid-slices of the volume with the
-       heatmap overlaid, and saves one figure per subject to
-       gradcam_results_bsnip/.
+       heatmap overlaid, and saves one figure per subject.
 
 Orientation note: .npy volumes carry no NIfTI affine/header, so the mapping
 from array axis -> anatomical plane can't be read back out; AXIS_VIEW_MAP
@@ -21,12 +28,13 @@ below assumes the standard SPM/MNI (X, Y, Z) = (sagittal, coronal, axial)
 voxel ordering typical of these dimensions. Adjust it if your data differs.
 
 Usage:
-    python gradcam_bsnip.py --num-samples 5 --output-dir gradcam_results_bsnip --device cuda
+    python gradcam_bsnip.py --exp-name v3_gap --num-samples 5 --device cuda
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
 from typing import Optional, Sequence
@@ -39,13 +47,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from bsnip_dataset import LABEL_NAMES, get_bsnip_dataloaders
-from train_3dcnn import NUM_CLASSES, BSNIP3DCNN, infer_input_shape
+from train_3dcnn import NUM_CLASSES, RUNS_DIR, BSNIP3DCNN, infer_input_shape
 
 logger = logging.getLogger("gradcam_bsnip")
 
-DEFAULT_MODEL_PATH = Path("best_bsnip_3dcnn.pth")
+# Fallbacks used only when --exp-name is not given (and the corresponding
+# manual override isn't either) — the pre-runs/ top-level file layout.
+FALLBACK_MODEL_PATH = Path("best_bsnip_3dcnn.pth")
+FALLBACK_OUTPUT_DIR = Path("gradcam_results_bsnip")
 DEFAULT_METADATA_CSV = Path("bsnip_preprocessed_npy_metadata.csv")
-DEFAULT_OUTPUT_DIR = Path("gradcam_results_bsnip")
 
 # array axis -> (view name, axis index) for a (D, H, W) volume shaped like
 # BSNIP's SPM12-normalized (121, 145, 121) Grey Matter maps; see module
@@ -133,16 +143,69 @@ def plot_gradcam(
     plt.close(fig)
 
 
+def resolve_model_path(args: argparse.Namespace) -> Path:
+    """--model-path overrides; else derive from --exp-name; else the pre-runs/ fallback."""
+    if args.model_path is not None:
+        return args.model_path
+    if args.exp_name is not None:
+        return RUNS_DIR / args.exp_name / "best_model.pth"
+    return FALLBACK_MODEL_PATH
+
+
+def resolve_output_dir(args: argparse.Namespace) -> Path:
+    """--output-dir overrides; else derive from --exp-name; else the pre-runs/ fallback."""
+    if args.output_dir is not None:
+        return args.output_dir
+    if args.exp_name is not None:
+        return RUNS_DIR / args.exp_name / "gradcam_results"
+    return FALLBACK_OUTPUT_DIR
+
+
+def resolve_use_gap(args: argparse.Namespace) -> bool:
+    """--use-gap overrides; else read from runs/<exp_name>/experiment_summary.json; else False."""
+    if args.use_gap is not None:
+        return args.use_gap
+
+    if args.exp_name is not None:
+        summary_path = RUNS_DIR / args.exp_name / "experiment_summary.json"
+        if summary_path.exists():
+            try:
+                with summary_path.open() as f:
+                    summary = json.load(f)
+                use_gap = summary.get("hyperparameters", {}).get("use_gap")
+                if use_gap is not None:
+                    logger.info("Read use_gap=%s from %s", use_gap, summary_path)
+                    return bool(use_gap)
+                logger.warning("'use_gap' not found in %s hyperparameters; defaulting to False", summary_path)
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("Could not read use_gap from %s (%s); defaulting to False", summary_path, exc)
+        else:
+            logger.warning("%s not found; defaulting use_gap=False (pass --use-gap to override)", summary_path)
+
+    return False
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate 3D Grad-CAM overlays for the BSNIP 3D CNN.")
-    parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH,
-                         help="Path to the trained checkpoint (default: %(default)s)")
+    parser.add_argument("--exp-name", type=str, default=None,
+                         help="Experiment name from train_3dcnn.py. If given, --model-path defaults to "
+                              "runs/<exp_name>/best_model.pth, --output-dir to "
+                              "runs/<exp_name>/gradcam_results/, and use_gap is auto-read from "
+                              "runs/<exp_name>/experiment_summary.json.")
+    parser.add_argument("--model-path", type=Path, default=None,
+                         help="Path to the trained checkpoint. Manual override of the path derived from "
+                              f"--exp-name (default without --exp-name: {FALLBACK_MODEL_PATH})")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                         help="Directory to save Grad-CAM figures into. Manual override of the path "
+                              f"derived from --exp-name (default without --exp-name: {FALLBACK_OUTPUT_DIR})")
+    parser.add_argument("--use-gap", action=argparse.BooleanOptionalAction, default=None,
+                         help="Whether the checkpoint was trained with a GAP head. Manual override of the "
+                              "value auto-read from runs/<exp_name>/experiment_summary.json (default "
+                              "without --exp-name: False)")
     parser.add_argument("--metadata-csv", type=Path, default=DEFAULT_METADATA_CSV,
                          help="Path to bsnip_preprocessed_npy_metadata.csv (default: %(default)s)")
     parser.add_argument("--num-samples", type=int, default=5,
                          help="Number of subjects per class (HC, SZ) to visualize (default: %(default)s)")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR,
-                         help="Directory to save Grad-CAM figures into (default: %(default)s)")
     parser.add_argument("--seed", type=int, default=42,
                          help="Seed for the train/val/test split (must match training) and sample selection (default: %(default)s)")
     parser.add_argument("--device", type=str, default=None, choices=["cuda", "cpu"],
@@ -159,7 +222,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     logger.info("Using device: %s", device)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    model_path = resolve_model_path(args)
+    output_dir = resolve_output_dir(args)
+    use_gap = resolve_use_gap(args)
+    logger.info("Model path: %s | Output dir: %s | use_gap: %s", model_path, output_dir, use_gap)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     _, _, test_loader = get_bsnip_dataloaders(
         metadata_csv=args.metadata_csv, batch_size=1, num_workers=0, random_state=args.seed,
@@ -170,8 +238,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     input_shape = infer_input_shape(test_loader)
     logger.info("Inferred volume input shape (D, H, W): %s", input_shape)
 
-    model = BSNIP3DCNN(input_shape=input_shape, num_classes=NUM_CLASSES).to(device)
-    model.load_state_dict(torch.load(args.model_path, map_location=device))
+    model = BSNIP3DCNN(input_shape=input_shape, num_classes=NUM_CLASSES, use_gap=use_gap).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
     extractor = GradCAMExtractor(model, model.conv3)
@@ -199,14 +267,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 f"{subject_id} ({site}) | true={true_name} pred={pred_name} "
                 f"(p_SZ={probs[1]:.3f})"
             )
-            out_path = args.output_dir / f"{subject_id}_true-{true_name}_pred-{pred_name}.png"
+            out_path = output_dir / f"{subject_id}_true-{true_name}_pred-{pred_name}.png"
             plot_gradcam(volume, cam_resized, title, out_path)
             logger.info("Saved Grad-CAM for %s -> %s", subject_id, out_path)
             n_saved += 1
         except Exception as exc:  # noqa: BLE001 - log and continue past a bad subject
             logger.error("Failed to generate Grad-CAM for subject %s: %s", subject_id, exc)
 
-    logger.info("Done: %d/%d Grad-CAM figures saved to %s", n_saved, len(selected), args.output_dir)
+    logger.info("Done: %d/%d Grad-CAM figures saved to %s", n_saved, len(selected), output_dir)
 
 
 if __name__ == "__main__":

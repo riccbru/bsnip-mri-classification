@@ -154,14 +154,13 @@ def get_bsnip_dataloaders(
     val_size: float = 0.15,
     test_size: float = 0.15,
     random_state: int = 42,
+    augment: bool = False,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build stratified, subject-level train/val/test DataLoaders for BSNIP.
 
     Splits unique subject_ids (not rows) 70/15/15 by default, stratified on
     `label`, via sklearn.model_selection.train_test_split with a fixed
     random_state — so a given subject never appears in more than one split.
-    On-the-fly 3D augmentation (see BSNIPDataset) is enabled for the train
-    split only; val/test stay unaugmented.
 
     Args:
         metadata_csv: Path to bsnip_preprocessed_npy_metadata.csv.
@@ -170,6 +169,9 @@ def get_bsnip_dataloaders(
         val_size: Fraction of subjects held out for validation.
         test_size: Fraction of subjects held out for test.
         random_state: Seed for reproducible splits.
+        augment: If True, enable on-the-fly 3D augmentation (see
+            BSNIPDataset / _augment_volume) on the train split only.
+            val/test are always unaugmented regardless of this flag.
 
     Returns:
         (train_loader, val_loader, test_loader)
@@ -179,7 +181,7 @@ def get_bsnip_dataloaders(
 
     train_ids, val_ids, test_ids = _split_subject_ids(subjects, val_size, test_size, random_state)
 
-    train_dataset = BSNIPDataset(df, subject_ids=train_ids, is_train=True)
+    train_dataset = BSNIPDataset(df, subject_ids=train_ids, is_train=augment)
     val_dataset = BSNIPDataset(df, subject_ids=val_ids, is_train=False)
     test_dataset = BSNIPDataset(df, subject_ids=test_ids, is_train=False)
 
