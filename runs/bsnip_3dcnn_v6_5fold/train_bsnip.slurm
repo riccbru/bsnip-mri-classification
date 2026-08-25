@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=bsnip_cnn_v6_5fold
-#SBATCH --output=logs/bsnip_cnn_v6_5fold_%j.out
+#SBATCH --job-name=bsnip_3dcnn_v6_5fold
+#SBATCH --output=logs/bsnip_3dcnn_v6_5fold_%j.out
 #SBATCH --error=logs/bsnip_3dcnn_v6_5fold_%j.err
 #SBATCH --partition=gpu2
 #SBATCH --account=pi-bonnietfleming

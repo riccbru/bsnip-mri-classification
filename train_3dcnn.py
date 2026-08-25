@@ -38,14 +38,25 @@ augmentation, inverse-frequency class-weighted loss, a GAP head instead of
 flatten, and val-tuned decision-threshold evaluation on top of the default
 p=0.5. Each also accepts a --no-<flag> form (e.g. --no-tune-threshold).
 
+Optimizer/schedule knobs: --weight-decay (default 1e-4), --scheduler
+{none,cosine} (default "none" — constant --lr for the whole run; "cosine"
+uses CosineAnnealingLR(T_max=epochs, eta_min=1e-6)), and --patience (>0
+early-stops a split/fold once val_auc hasn't improved for that many
+consecutive epochs; 0 disables it). Note: earlier versions of this script
+always ran an adaptive ReduceLROnPlateau(mode="max") scheduler on val_auc;
+that's been replaced by the explicit --scheduler flag above, so a bare
+`train_3dcnn.py` invocation with no --scheduler now trains at a constant
+learning rate rather than automatically reducing it on a plateau.
+
 Usage:
     # Single split (default)
     python train_3dcnn.py --exp-name v3_gap --epochs 50 --batch-size 4 --lr 2e-5 \\
         --seed 42 --device cuda --augment --weighted-loss --use-gap
 
-    # 5-fold cross-validation
-    python train_3dcnn.py --exp-name v6_cv5 --cv-folds 5 --epochs 50 \\
-        --batch-size 4 --lr 2e-5 --seed 42 --device cuda --augment --use-gap
+    # 5-fold cross-validation, cosine schedule, early stopping
+    python train_3dcnn.py --exp-name v6_cv5 --cv-folds 5 --epochs 50 --patience 15 \\
+        --batch-size 4 --lr 2e-5 --weight-decay 1e-4 --scheduler cosine \\
+        --seed 42 --device cuda --augment --use-gap
 """
 
 from __future__ import annotations
@@ -476,17 +487,28 @@ def train_one_split(
     output_dir: Path,
     epochs: int,
     lr: float,
+    weight_decay: float,
     checkpoint_metric: str,
     weighted_loss: bool,
+    scheduler_name: str = "none",
+    patience: int = 0,
     log_tag: str = "",
 ) -> tuple[Path, list[dict[str, float]], dict[str, float]]:
-    """Train `model` on (train_loader, val_loader) for `epochs`, writing
+    """Train `model` on (train_loader, val_loader) for up to `epochs`, writing
     best_model.pth / training_log.csv / training_curves.png into output_dir.
 
     Shared by both the single-split path (--cv-folds 0) and each fold of
     the cross-validation path (--cv-folds > 1) — `val_loader` there is a
     fold's Inner-Val loader, so "New best checkpoint" selection is always
     based on validation data the outer test set never touches.
+
+    scheduler_name: "none" (constant `lr` throughout) or "cosine"
+    (CosineAnnealingLR(T_max=epochs, eta_min=1e-6), stepped once per epoch).
+
+    patience: if > 0, stop early once val_auc hasn't improved on its own
+    best-seen value for `patience` consecutive epochs — independent of
+    `checkpoint_metric` (which only controls what counts as "best" for
+    saving best_model.pth). 0 disables early stopping.
 
     `log_tag` (e.g. "[fold 2/5] ") is prefixed onto this function's log
     lines for readability inside a CV loop; empty in single-split mode.
@@ -510,13 +532,19 @@ def train_one_split(
         logger.info("%sWeighted loss disabled — using unweighted CrossEntropyLoss", log_tag)
         criterion = nn.CrossEntropyLoss()
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    if scheduler_name == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    else:
+        scheduler = None
 
     init_log_csv(log_csv_path)
     history: list[dict[str, float]] = []
     best_metric = float("-inf") if checkpoint_metric == "val_auc" else float("inf")
     best_val_summary: dict[str, float] = {}
+    best_val_auc_for_early_stop = float("-inf")
+    epochs_no_improve = 0
+    stopped_early = False
 
     for epoch in range(1, epochs + 1):
         train_loss, train_metrics = run_epoch(model, train_loader, criterion, device, optimizer)
@@ -539,10 +567,8 @@ def train_one_split(
             val_loss, val_metrics["acc"], val_metrics["balanced_acc"], val_metrics["auc"],
         )
 
-        if not np.isnan(val_metrics["auc"]):
-            scheduler.step(val_metrics["auc"])
-        else:
-            logger.warning("%sSkipping LR scheduler step: val_auc is NaN this epoch", log_tag)
+        if scheduler is not None:
+            scheduler.step()  # CosineAnnealingLR steps per-epoch, not on a metric
 
         current_metric = val_metrics["auc"] if checkpoint_metric == "val_auc" else val_loss
         if not np.isnan(current_metric) and is_better(current_metric, best_metric, checkpoint_metric):
@@ -551,7 +577,22 @@ def train_one_split(
             torch.save(model.state_dict(), checkpoint_path)
             logger.info("%sNew best checkpoint (%s=%.4f) saved to %s", log_tag, checkpoint_metric, best_metric, checkpoint_path)
 
-    logger.info("%sTraining complete. Best %s: %.4f", log_tag, checkpoint_metric, best_metric)
+        if not np.isnan(val_metrics["auc"]) and val_metrics["auc"] > best_val_auc_for_early_stop:
+            best_val_auc_for_early_stop = val_metrics["auc"]
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        if patience > 0 and epochs_no_improve >= patience:
+            logger.info(
+                "%sEarly stopping at epoch %d/%d: val_auc hasn't improved for %d consecutive epochs",
+                log_tag, epoch, epochs, patience,
+            )
+            stopped_early = True
+            break
+
+    status = f"early-stopped after {len(history)} epochs" if stopped_early else "training complete"
+    logger.info("%s%s. Best %s: %.4f", log_tag, status.capitalize(), checkpoint_metric, best_metric)
     make_and_save_curves(history, curves_path)
 
     return checkpoint_path, history, best_val_summary
@@ -709,7 +750,8 @@ def run_single_split(args: argparse.Namespace, exp_name: str, exp_dir: Path, dev
 
     checkpoint_path, _history, best_val_summary = train_one_split(
         model, train_loader, val_loader, device, exp_dir,
-        args.epochs, args.lr, args.checkpoint_metric, args.weighted_loss,
+        args.epochs, args.lr, args.weight_decay, args.checkpoint_metric, args.weighted_loss,
+        scheduler_name=args.scheduler, patience=args.patience,
     )
 
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
@@ -765,7 +807,8 @@ def run_cross_validation(args: argparse.Namespace, exp_name: str, exp_dir: Path,
 
         checkpoint_path, _history, best_val_summary = train_one_split(
             model, train_loader, inner_val_loader, device, fold_dir,
-            args.epochs, args.lr, args.checkpoint_metric, args.weighted_loss, log_tag=log_tag,
+            args.epochs, args.lr, args.weight_decay, args.checkpoint_metric, args.weighted_loss,
+            scheduler_name=args.scheduler, patience=args.patience, log_tag=log_tag,
         )
 
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
@@ -833,6 +876,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs (default: %(default)s)")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size (default: %(default)s)")
     parser.add_argument("--lr", type=float, default=2e-5, help="Adam learning rate (default: %(default)s)")
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Adam weight decay (default: %(default)s)")
+    parser.add_argument("--scheduler", type=str, default="none", choices=["none", "cosine"],
+                         help="LR scheduler: 'none' (constant --lr throughout) or 'cosine' "
+                              "(CosineAnnealingLR, T_max=epochs, eta_min=1e-6) (default: %(default)s)")
+    parser.add_argument("--patience", type=int, default=0,
+                         help="Early stop if val_auc hasn't improved for this many consecutive "
+                              "epochs (independent of --checkpoint-metric). 0 disables early "
+                              "stopping (default: %(default)s)")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker count (default: %(default)s)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed, also used for the data split (default: %(default)s)")
     parser.add_argument("--device", type=str, default=None, choices=["cuda", "cpu"],
