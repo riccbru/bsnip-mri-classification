@@ -1,0 +1,66 @@
+{
+  "exp_name": "bsnip_cnn_v6_5fold",
+  "fold": 5,
+  "n_folds": 5,
+  "created_at": "2026-08-23T19:25:38",
+  "best_val": {
+    "epoch": 45,
+    "val_loss": 0.8802012542883555,
+    "acc": 0.43333333333333335,
+    "balanced_acc": 0.5,
+    "auc": 0.6380090497737557
+  },
+  "outer_test_auc": 0.6421356421356421,
+  "test": {
+    "tune_threshold": true,
+    "threshold_metric": "balanced_accuracy",
+    "optimal_threshold": 0.6999999999999996,
+    "optimal_threshold_val_score": 0.6674208144796381,
+    "metrics_by_threshold": {
+      "Default (p=0.50)": {
+        "threshold": 0.5,
+        "precision_macro": 0.22,
+        "recall_macro": 0.5,
+        "f1_macro": 0.3055555555555556,
+        "balanced_acc": 0.5,
+        "acc": 0.44,
+        "per_class": {
+          "HC": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1_score": 0.0,
+            "support": 42
+          },
+          "SZ": {
+            "precision": 0.44,
+            "recall": 1.0,
+            "f1_score": 0.6111111111111112,
+            "support": 33
+          }
+        }
+      },
+      "Tuned (p*=0.70)": {
+        "threshold": 0.6999999999999996,
+        "precision_macro": 0.6295454545454545,
+        "recall_macro": 0.6028138528138528,
+        "f1_macro": 0.5601173020527859,
+        "balanced_acc": 0.6028138528138528,
+        "acc": 0.5733333333333334,
+        "per_class": {
+          "HC": {
+            "precision": 0.75,
+            "recall": 0.35714285714285715,
+            "f1_score": 0.4838709677419355,
+            "support": 42
+          },
+          "SZ": {
+            "precision": 0.509090909090909,
+            "recall": 0.8484848484848485,
+            "f1_score": 0.6363636363636364,
+            "support": 33
+          }
+        }
+      }
+    }
+  }
+}
